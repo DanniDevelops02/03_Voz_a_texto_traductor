@@ -2,12 +2,13 @@ import base64
 import hashlib
 import io
 import tempfile
+import time
 from html import escape
 from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from gtts import gTTS
 from PIL import Image
 
@@ -25,16 +26,17 @@ st.set_page_config(
 # =====================================================================
 #  CONTENIDO
 # =====================================================================
-IMAGEN = "OIG7.jpg"
+IMAGEN = "Traductor_Storybook.jpg"
 
 # "voz" = código que entiende el reconocimiento de voz del navegador
+# "respaldo" = código del traductor de respaldo (MyMemory)
 IDIOMAS = {
-    "Español": {"codigo": "es", "voz": "es-ES"},
-    "Inglés": {"codigo": "en", "voz": "en-US"},
-    "Bengalí": {"codigo": "bn", "voz": "bn-BD"},
-    "Coreano": {"codigo": "ko", "voz": "ko-KR"},
-    "Mandarín": {"codigo": "zh-CN", "voz": "zh-CN"},
-    "Japonés": {"codigo": "ja", "voz": "ja-JP"},
+    "Español": {"codigo": "es", "voz": "es-ES", "respaldo": "es-ES"},
+    "Inglés": {"codigo": "en", "voz": "en-US", "respaldo": "en-GB"},
+    "Bengalí": {"codigo": "bn", "voz": "bn-BD", "respaldo": "bn-IN"},
+    "Coreano": {"codigo": "ko", "voz": "ko-KR", "respaldo": "ko-KR"},
+    "Mandarín": {"codigo": "zh-CN", "voz": "zh-CN", "respaldo": "zh-CN"},
+    "Japonés": {"codigo": "ja", "voz": "ja-JP", "respaldo": "ja-JP"},
 }
 
 ACENTOS = {
@@ -496,10 +498,45 @@ def reproductor(audio_bytes: bytes) -> str:
 BASE = Path(__file__).parent
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def generar_audio(texto: str, idioma: str, tld: str) -> bytes:
-    buffer = io.BytesIO()
-    gTTS(texto, lang=idioma, tld=tld, slow=False).write_to_fp(buffer)
-    return buffer.getvalue()
+    """Genera el MP3 (con 2 intentos). Si ya se generó igual, usa la copia guardada."""
+    ultimo_error = None
+    for intento in range(2):
+        try:
+            buffer = io.BytesIO()
+            gTTS(texto, lang=idioma, tld=tld, slow=False).write_to_fp(buffer)
+            return buffer.getvalue()
+        except Exception as error:
+            ultimo_error = error
+            time.sleep(1.5)
+    raise ultimo_error
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def traducir_texto(texto: str, origen: str, destino: str) -> tuple[str, str]:
+    """Traduce con Google (2 intentos) y, si está saturado, con MyMemory como respaldo.
+
+    Devuelve (traducción, nombre del servicio usado).
+    """
+    ultimo_error = None
+    for intento in range(2):
+        try:
+            traduccion = GoogleTranslator(
+                source=IDIOMAS[origen]["codigo"], target=IDIOMAS[destino]["codigo"]
+            ).translate(texto)
+            return traduccion, "Google"
+        except Exception as error:
+            ultimo_error = error
+            time.sleep(1.5)
+
+    try:
+        traduccion = MyMemoryTranslator(
+            source=IDIOMAS[origen]["respaldo"], target=IDIOMAS[destino]["respaldo"]
+        ).translate(texto)
+        return traduccion, "MyMemory"
+    except Exception:
+        raise ultimo_error
 
 
 def transcribir_wav(wav_bytes: bytes, idioma_voz: str) -> str:
@@ -633,24 +670,34 @@ if traducir:
     if not texto.strip():
         st.warning("Habla, graba o escribe un texto antes de traducir.")
     else:
+        traduccion = None
         with st.spinner("Traduciendo..."):
             try:
-                traduccion = GoogleTranslator(
-                    source=IDIOMAS[entrada]["codigo"], target=IDIOMAS[salida]["codigo"]
-                ).translate(texto)
-                audio_traducido = generar_audio(
-                    traduccion, IDIOMAS[salida]["codigo"], ACENTOS[acento]
-                )
-                st.session_state["resultado"] = {
-                    "texto": traduccion,
-                    "audio": audio_traducido,
-                    "idioma": salida,
-                }
-            except Exception as error:
+                traduccion, servicio = traducir_texto(texto.strip(), entrada, salida)
+            except Exception:
                 st.error(
-                    "No se pudo traducir o generar el audio. Revisa tu conexión e "
-                    f"inténtalo de nuevo. ({error})"
+                    "Los servicios de traducción están saturados en este momento. "
+                    "Espera unos segundos y vuelve a pulsar el botón."
                 )
+
+        if traduccion:
+            audio_traducido = None
+            with st.spinner("Generando audio..."):
+                try:
+                    audio_traducido = generar_audio(
+                        traduccion, IDIOMAS[salida]["codigo"], ACENTOS[acento]
+                    )
+                except Exception:
+                    st.warning(
+                        "La traducción está lista, pero no se pudo generar el audio "
+                        "(el servicio de voz está saturado). Vuelve a intentarlo en unos segundos."
+                    )
+            st.session_state["resultado"] = {
+                "texto": traduccion,
+                "audio": audio_traducido,
+                "idioma": salida,
+                "servicio": servicio,
+            }
 
 # ---- 4. Resultado ----
 resultado = st.session_state.get("resultado")
@@ -662,14 +709,17 @@ if resultado:
             f'<div class="resultado">{escape(resultado["texto"])}</div>',
             unsafe_allow_html=True,
         )
-        components.html(reproductor(resultado["audio"]), height=120)
-        st.download_button(
-            "Descargar MP3",
-            data=resultado["audio"],
-            file_name="traduccion.mp3",
-            mime="audio/mpeg",
-            use_container_width=True,
-        )
+        if resultado["audio"]:
+            components.html(reproductor(resultado["audio"]), height=120)
+            st.download_button(
+                "Descargar MP3",
+                data=resultado["audio"],
+                file_name="traduccion.mp3",
+                mime="audio/mpeg",
+                use_container_width=True,
+            )
+        if resultado.get("servicio") == "MyMemory":
+            st.caption("Traducido con el servicio de respaldo (MyMemory).")
 
 st.write("")
 st.caption("Traducción y voz con servicios de Google (deep-translator y gTTS).")
